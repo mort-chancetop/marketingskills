@@ -2,7 +2,7 @@
 name: seo-audit
 description: When the user wants to audit, review, or diagnose SEO issues on their site. Also use when the user mentions "SEO audit," "technical SEO," "why am I not ranking," "SEO issues," "on-page SEO," "meta tags review," "SEO health check," "my traffic dropped," "lost rankings," "not showing up in Google," "site isn't ranking," "Google update hit me," "page speed," "core web vitals," "crawl errors," or "indexing issues." Use this even if the user just says something vague like "my SEO is bad" or "help with SEO" — start with an audit. For building pages at scale to target keywords, see programmatic-seo. For adding structured data, see schema-markup. For AI search optimization, see ai-seo.
 metadata:
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # SEO Audit
@@ -35,18 +35,97 @@ Before auditing, understand:
 
 ## Audit Framework
 
-### Schema Markup Detection Limitation
+### `web_fetch` HTML Stripping Limitation
 
-**`web_fetch` and `curl` cannot reliably detect structured data / schema markup.**
+**`web_fetch` converts HTML to markdown and strips the entire `<head>` section.** This means it CANNOT detect:
 
-Many CMS plugins (AIOSEO, Yoast, RankMath) inject JSON-LD via client-side JavaScript — it won't appear in static HTML or `web_fetch` output (which strips `<script>` tags during conversion).
+- `<meta name="description">` (meta descriptions)
+- `<meta property="og:*">` (Open Graph tags)
+- `<meta name="twitter:*">` (Twitter Card tags)
+- `<link rel="canonical">` (canonical tags)
+- `<link rel="alternate" hreflang="...">` (hreflang tags)
+- `<meta name="robots">` (robots directives)
+- `<script type="application/ld+json">` (schema markup / JSON-LD)
 
-**To accurately check for schema markup, use one of these methods:**
-1. **Browser tool** — render the page and run: `document.querySelectorAll('script[type="application/ld+json"]')`
-2. **Google Rich Results Test** — https://search.google.com/test/rich-results
-3. **Screaming Frog export** — if the client provides one, use it (SF renders JavaScript)
+**Reporting "not found" based solely on `web_fetch` output leads to false audit findings.**
 
-Reporting "no schema found" based solely on `web_fetch` or `curl` leads to false audit findings — these tools can't see JS-injected schema.
+### How to Verify `<head>` SEO Elements
+
+**For meta tags, canonical tags, hreflang, and OG tags**, use `curl` with raw HTML parsing:
+
+```bash
+curl -s -L "https://example.com" | python3 -c "
+import sys, re
+html = sys.stdin.read()
+for tag in re.findall(r'<meta[^>]*>', html, re.IGNORECASE):
+    print(tag)
+for tag in re.findall(r'<link[^>]*(?:canonical|alternate)[^>]*>', html, re.IGNORECASE):
+    print(tag)
+"
+```
+
+Run this for EVERY page being audited. Never skip this step.
+
+**For schema markup / JSON-LD**, use one of these methods:
+1. **`curl` + regex** — extract `<script type="application/ld+json">` blocks from raw HTML
+2. **Google Rich Results Test** — https://search.google.com/test/rich-results (renders JavaScript)
+3. **Browser tool** — run: `document.querySelectorAll('script[type="application/ld+json"]')`
+4. **Screaming Frog export** — if the client provides one, use it (SF renders JavaScript)
+
+Note: `curl` will find JSON-LD embedded in static HTML but NOT schema injected via client-side JavaScript. For JS-injected schema, use the Rich Results Test or a browser tool.
+
+### Redirect Verification
+
+**`web_fetch` auto-follows redirects silently.** It cannot detect 301/302 redirects, redirect chains, or missing redirects. Two URLs may appear to serve identical content when one actually redirects to the other.
+
+**To check redirects**, use `curl` without `-L`:
+
+```bash
+curl -s -o /dev/null -w "Status: %{http_code}, Redirect: %{redirect_url}\n" "https://example.com"
+```
+
+Run this for every redirect scenario being audited (www vs non-www, HTTP vs HTTPS, trailing slash, etc.).
+
+### Large Page Content Rendering
+
+**`web_fetch` can poorly convert large SSR pages (400KB+).** On pages with heavy inline CSS/JS (common in Next.js, Nuxt, SvelteKit), `web_fetch` may return mostly CSS/JS fragments, making it appear the page has no content — even when the HTML is fully server-side rendered.
+
+**If `web_fetch` shows mostly CSS/JS for a page, verify with `curl`:**
+
+```bash
+curl -s -L "https://example.com/page" | python3 -c "
+import sys, re
+data = sys.stdin.read()
+# Strip scripts and styles
+clean = re.sub(r'<script[^>]*>.*?</script>', '', data, flags=re.DOTALL | re.IGNORECASE)
+clean = re.sub(r'<style[^>]*>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+# Find headings
+for tag in ['h1','h2','h3']:
+    matches = re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', clean, re.IGNORECASE | re.DOTALL)
+    texts = [re.sub(r'<[^>]+>', '', m).strip() for m in matches if re.sub(r'<[^>]+>', '', m).strip()]
+    if texts: print(f'{tag.upper()}: {texts[:5]}')
+# Count content paragraphs
+ps = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.IGNORECASE | re.DOTALL)
+real = [p for p in ps if len(re.sub(r'<[^>]+>', '', p).strip()) > 30]
+print(f'Content paragraphs: {len(real)}')
+"
+```
+
+Do NOT report "JS rendering issues" or "content not rendered" based solely on `web_fetch` output. Always confirm with `curl` + HTML parsing first.
+
+### When to Use `web_fetch` vs `curl`
+
+| Check | Use `web_fetch` | Use `curl` |
+|-------|----------------|------------|
+| Page content, headings, body text | ✅ Yes (but verify large pages with curl) | Required for large/SSR pages |
+| Internal/external links | ✅ Yes | Overkill |
+| Image alt text | ✅ Yes (partial) | Better for completeness |
+| Meta descriptions | ❌ No — stripped | ✅ Required |
+| Canonical / hreflang tags | ❌ No — stripped | ✅ Required |
+| OG / Twitter meta tags | ❌ No — stripped | ✅ Required |
+| Robots meta tag | ❌ No — stripped | ✅ Required |
+| Schema markup (JSON-LD) | ❌ No — stripped | ✅ For static; Rich Results Test for JS-injected |
+| Redirects (301/302) | ❌ No — auto-follows | ✅ Required (without `-L`) |
 
 ### Priority Order
 1. **Crawlability & Indexation** (can Google find and index it?)
@@ -382,7 +461,7 @@ Same format as above
 - Mobile-Friendly Test
 - Schema Validator
 
-> **Note on schema detection:** `web_fetch` strips `<script>` tags (including JSON-LD) and cannot detect JS-injected schema. Use the browser tool, Rich Results Test, or Screaming Frog instead — they render JavaScript and capture dynamically-injected markup. See the Schema Markup Detection Limitation section above.
+> **Note on `web_fetch` limitations:** `web_fetch` strips the entire HTML `<head>` section during markdown conversion. This means it cannot detect meta descriptions, canonical tags, hreflang, OG tags, robots meta, or JSON-LD schema. **Always use `curl` with raw HTML parsing to verify `<head>`-level SEO elements.** See the "`web_fetch` HTML Stripping Limitation" section above for the required verification method.
 
 **Paid Tools** (if available)
 - Screaming Frog
